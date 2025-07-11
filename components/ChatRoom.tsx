@@ -22,15 +22,6 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
   const socketRef = useRef<Socket | null>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
 
-  const handleMuteToggle = useCallback(() => {
-    if (localStream) {
-      localStream.getAudioTracks().forEach((track) => {
-        track.enabled = !track.enabled;
-      });
-      setIsMuted(prev => !prev);
-    }
-  }, [localStream]);
-
   const addPeer = useCallback((peerId: string, peerUsername: string, stream?: MediaStream) => {
     setPeers(prev => new Map(prev).set(peerId, { id: peerId, username: peerUsername, stream, isMuted: false }));
   }, []);
@@ -45,52 +36,71 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
     });
   }, []);
   
-  const createPeerConnection = (peerId: string, peerUsername: string, isInitiator: boolean, stream: MediaStream) => {
-    if (peerConnectionsRef.current.has(peerId)) {
-        return;
-    }
-    const pc = new RTCPeerConnection(STUN_SERVERS);
-    peerConnectionsRef.current.set(peerId, pc);
-    addPeer(peerId, peerUsername);
-
-    stream.getTracks().forEach(track => pc.addTrack(track, stream));
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socketRef.current?.emit('ice-candidate', { target: peerId, candidate: event.candidate });
-      }
-    };
-    
-    pc.ontrack = (event) => {
-      console.log('Received remote track from', peerUsername);
-      setPeers(prev => {
-        const newPeers = new Map(prev);
-        const peer = newPeers.get(peerId);
-        if (peer) {
-          const updatedPeer: Peer = { ...peer, stream: event.streams[0] };
-          newPeers.set(peerId, updatedPeer);
-        }
-        return newPeers;
+  const handleMuteToggle = useCallback(() => {
+    if (localStream) {
+      const enabled = !isMuted;
+      localStream.getAudioTracks().forEach((track) => {
+        track.enabled = enabled;
       });
-    };
-    
-    pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') {
-            setStatus('Connected');
-        }
-    };
-
-    if (isInitiator) {
-        pc.createOffer()
-            .then(offer => pc.setLocalDescription(offer))
-            .then(() => {
-                socketRef.current?.emit('offer', { target: peerId, sdp: pc.localDescription });
-            })
-            .catch(e => console.error("Error creating offer", e));
+      setIsMuted(!enabled);
     }
-  };
+  }, [localStream, isMuted]);
 
   useEffect(() => {
+    const peerConnections = peerConnectionsRef.current;
+    
+    const createPeerConnection = (peerId: string, peerUsername: string, isInitiator: boolean, stream: MediaStream) => {
+      if (peerConnections.has(peerId)) {
+          console.warn('Peer connection already exists for', peerId);
+          return;
+      }
+      const pc = new RTCPeerConnection(STUN_SERVERS);
+      peerConnections.set(peerId, pc);
+      addPeer(peerId, peerUsername);
+
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socketRef.current?.emit('ice-candidate', { target: peerId, candidate: event.candidate });
+        }
+      };
+      
+      pc.ontrack = (event) => {
+        console.log('Received remote track from', peerUsername, event.streams[0]);
+        setPeers(prev => {
+          const newPeers = new Map(prev);
+          const peer = newPeers.get(peerId);
+          if (peer) {
+            const updatedPeer: Peer = { ...peer, stream: event.streams[0] };
+            newPeers.set(peerId, updatedPeer);
+          }
+          return newPeers;
+        });
+      };
+      
+      pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'connected') {
+              setStatus('Connected');
+              console.log(`Connection to ${peerUsername} is successful.`);
+          }
+          if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+              console.log(`Connection to ${peerUsername} failed/disconnected.`);
+              removePeer(peerId);
+          }
+      };
+
+      if (isInitiator) {
+          pc.createOffer()
+              .then(offer => pc.setLocalDescription(offer))
+              .then(() => {
+                  socketRef.current?.emit('offer', { target: peerId, sdp: pc.localDescription });
+              })
+              .catch(e => console.error("Error creating offer", e));
+      }
+    };
+
+
     const init = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -106,25 +116,23 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
             socket.emit('join-room', { roomId, username: localUsername });
         });
         
-        // Fired when you successfully join a room, giving you a list of existing users
         socket.on('all-users', (payload: AllUsersPayload) => {
-          setStatus('Connected. Waiting for others...');
+          setStatus(payload.users.length > 0 ? 'Connecting to peers...' : 'Waiting for others...');
           console.log('Got all users:', payload.users);
           payload.users.forEach(user => {
             createPeerConnection(user.id, user.username, true, stream);
           });
         });
 
-        // Fired when a new user joins the room
-        socket.on('user-joined', (payload: UserJoinedPayload) => {
-          setStatus('Peer connected. Setting up...');
-          console.log('User joined:', payload.username);
-          createPeerConnection(payload.id, payload.username, false, stream);
-        });
-
         socket.on('offer', async (payload: OfferPayload) => {
             console.log('Received offer from', payload.username);
-            const pc = peerConnectionsRef.current.get(payload.from);
+            
+            // This is the key change: create the connection if it doesn't exist.
+            if (!peerConnections.has(payload.from)) {
+              createPeerConnection(payload.from, payload.username, false, stream);
+            }
+
+            const pc = peerConnections.get(payload.from);
             if (pc) {
                 await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
                 const answer = await pc.createAnswer();
@@ -135,14 +143,14 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
         
         socket.on('answer', async (payload: AnswerPayload) => {
             console.log('Received answer from peer');
-            const pc = peerConnectionsRef.current.get(payload.from);
+            const pc = peerConnections.get(payload.from);
             if (pc) {
                 await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
             }
         });
 
         socket.on('ice-candidate', async (payload: IceCandidatePayload) => {
-            const pc = peerConnectionsRef.current.get(payload.from);
+            const pc = peerConnections.get(payload.from);
             if (pc && payload.candidate) {
                 await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
             }
@@ -151,7 +159,7 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
         socket.on('user-left', (payload: { id: string }) => {
             console.log('User left:', payload.id);
             removePeer(payload.id);
-            if(peers.size === 1) setStatus('Peer left. Waiting for others...');
+            if(peerConnections.size === 0) setStatus('Peer left. Waiting for others...');
         });
         
         socket.on('room-full', () => {
@@ -177,10 +185,9 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
       console.log("Cleaning up ChatRoom component");
       localStream?.getTracks().forEach(track => track.stop());
       socketRef.current?.disconnect();
-      peerConnectionsRef.current.forEach(pc => pc.close());
+      peerConnections.forEach(pc => pc.close());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, localUsername]);
+  }, [roomId, localUsername, addPeer, removePeer]);
 
   if (error) {
     return <div className="text-center p-8 bg-red-900/50 rounded-lg"><h2 className="text-xl font-bold text-red-400">Error</h2><p>{error}</p></div>
@@ -216,7 +223,7 @@ const ChatRoom: React.FC<ChatRoomProps> = ({ roomId, localUsername }) => {
                 />
             ))}
         </div>
-        {peerList.length === 0 && localStream &&
+        {peerList.length === 0 && localStream && status !== 'Connecting...' && status !== 'Initializing connection...' &&
           <div className="mt-8 text-center p-8 bg-gray-800 rounded-xl">
             <p className="text-lg text-gray-300">You're the first one here!</p>
             <p className="text-sm text-gray-500 mt-2">Share the page URL to invite someone.</p>

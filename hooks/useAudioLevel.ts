@@ -3,6 +3,7 @@ import { useState, useEffect, useRef } from 'react';
 export const useAudioLevel = (stream: MediaStream | null): number => {
   const [audioLevel, setAudioLevel] = useState(0);
   const animationFrameId = useRef<number | null>(null);
+  const levelRef = useRef(0); // For smoothing
 
   useEffect(() => {
     if (!stream || stream.getAudioTracks().length === 0) {
@@ -23,31 +24,41 @@ export const useAudioLevel = (stream: MediaStream | null): number => {
         }
 
         analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-
+        // A larger FFT size can help capture a more stable peak.
+        analyser.fftSize = 512;
+        
         source = audioContext.createMediaStreamSource(stream);
         source.connect(analyser);
 
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        const bufferLength = analyser.fftSize;
+        const dataArray = new Uint8Array(bufferLength);
         
         const animate = () => {
           if (isCancelled) return;
           
-          // Use time-domain data which is more direct for volume
           analyser.getByteTimeDomainData(dataArray);
           
-          let sumSquares = 0.0;
-          for (const amplitude of dataArray) {
-            // Samples are 0-255, 128 is the zero point. Normalize to -1.0 to 1.0.
-            const normalizedSample = (amplitude / 128.0) - 1.0;
-            sumSquares += normalizedSample * normalizedSample;
+          let peak = 0.0;
+          for (let i = 0; i < bufferLength; i++) {
+            // The samples are unsigned 8-bit integers, from 0 to 255.
+            // 128 is the 'zero' point (silence).
+            // We find the absolute distance from zero for each sample.
+            const value = Math.abs(dataArray[i] - 128);
+            if (value > peak) {
+              peak = value;
+            }
           }
           
-          // Calculate Root Mean Square and scale for better visualization
-          const rms = Math.sqrt(sumSquares / dataArray.length);
-          const level = Math.min(1.0, rms * 5);
+          // Normalize the peak to a 0-1 range (peak can be max 128).
+          const rawLevel = peak / 128.0;
           
-          setAudioLevel(level);
+          // Apply smoothing to prevent the meter from being too jittery.
+          // A lower smoothing factor means more responsive/less smooth.
+          const smoothingFactor = 0.6;
+          const smoothedLevel = (levelRef.current * smoothingFactor) + (rawLevel * (1 - smoothingFactor));
+          levelRef.current = smoothedLevel;
+          
+          setAudioLevel(smoothedLevel);
           animationFrameId.current = requestAnimationFrame(animate);
         };
 
