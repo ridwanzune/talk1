@@ -5,12 +5,16 @@
   "description": "A 1-to-1 WebRTC voice chat application server.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build": "esbuild index.tsx --bundle --outfile=index.js --jsx=automatic"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
     "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.2"
   }
 }
