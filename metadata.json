@@ -1,0 +1,7 @@
+{
+  "name": "WebRTC Voice Chat",
+  "description": "A 1-to-1 real-time voice chat application using WebRTC. Users can join a room by sharing a link, see audio levels for all participants, and mute their own microphone.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
